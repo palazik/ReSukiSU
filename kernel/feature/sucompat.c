@@ -252,6 +252,9 @@ extern bool ksud_execve_key;
 
 static inline void ksu_handle_execveat_init(const char *filename, void *envp)
 {
+    if (ksu_is_recovery_boot())
+        return;
+
     if (current->pid != 1 && is_init(current_cred())) {
         if (unlikely(strcmp(filename, KSUD_PATH) == 0)) {
             pr_info("hook_manager: escape to root for init executing ksud: %d\n", current->pid);
@@ -274,6 +277,9 @@ static inline void ksu_handle_execveat_init(const char *filename, void *envp)
 int ksu_handle_execve(int *fd, const char *filename, void *argv, void *envp, int *flags)
 {
     struct ksu_sulog_pending_event *pending_root_execve = NULL;
+
+    if (ksu_is_recovery_boot())
+        return 0;
 
     ksu_handle_execveat_init(filename, envp);
 
@@ -332,6 +338,9 @@ int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *
 int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *__unused_flags)
 {
     char path[sizeof(su_path) + 1] = { 0 };
+
+    if (ksu_is_recovery_boot())
+        return 0;
 
 #ifdef KSU_COMPAT_USE_STATIC_KEY
     // Yep, maybe someusers love turn off sucompat <- idk how they managed to keep using it

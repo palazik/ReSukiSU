@@ -6,8 +6,10 @@
 #include <linux/err.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/init.h>
 #include <linux/version.h>
 #include <linux/input.h>
+#include <linux/kernel.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0) && LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 #include <linux/sched/task.h>
 #endif
@@ -69,6 +71,66 @@ static const char KERNEL_SU_RC[] =
 
 static void stop_init_rc_hook(void);
 static void stop_execve_hook(void);
+
+bool ksu_is_recovery_boot(void)
+{
+#ifdef CONFIG_KSU_DISABLE_IN_RECOVERY
+    static bool recovery_boot;
+    static bool recovery_checked;
+    static bool recovery_logged;
+    static const char * const recovery_cmdline_tokens[] = {
+        "androidboot.mode=recovery",
+        "androidboot.bootmode=recovery",
+        "bootmode=recovery",
+        "androidboot.force_normal_boot=0",
+    };
+    static const char * const recovery_ramdisk_paths[] = {
+        "/init.recovery.qcom.rc",
+        "/init.recovery.usb.rc",
+        "/system/etc/recovery.fstab",
+        "/etc/recovery.fstab",
+        "/sbin/recovery",
+        "/twres",
+    };
+    int i;
+
+    if (recovery_boot)
+        return true;
+    if (recovery_checked)
+        return false;
+
+    if (saved_command_line) {
+        for (i = 0; i < ARRAY_SIZE(recovery_cmdline_tokens); i++) {
+            if (strstr(saved_command_line, recovery_cmdline_tokens[i])) {
+                recovery_boot = true;
+                break;
+            }
+        }
+    }
+
+    if (!recovery_boot) {
+        for (i = 0; i < ARRAY_SIZE(recovery_ramdisk_paths); i++) {
+            struct path path;
+
+            if (!kern_path(recovery_ramdisk_paths[i], LOOKUP_FOLLOW, &path)) {
+                path_put(&path);
+                recovery_boot = true;
+                break;
+            }
+        }
+    }
+
+    if (recovery_boot && !recovery_logged) {
+        pr_info("recovery boot detected, skipping KernelSU userspace hooks\n");
+        recovery_logged = true;
+    }
+
+    recovery_checked = true;
+    return recovery_boot;
+#else
+    return false;
+#endif
+}
 
 // clang-format off
 #if defined(CONFIG_KSU_TRACEPOINT_HOOK)
@@ -257,6 +319,9 @@ void ksu_handle_execveat_ksud(const char *filename, struct user_arg_ptr *argv, s
     /* This applies to versions between Android 6 ~ 9  */
     static const char old_system_init[] = "/init";
     static bool init_second_stage_executed = false;
+
+    if (ksu_is_recovery_boot())
+        return;
 
     // https://cs.android.com/android/platform/superproject/+/android-16.0.0_r2:system/core/init/main.cpp;l=77
     if (unlikely(!memcmp(filename, system_bin_init, sizeof(system_bin_init) - 1) && argv)) {
@@ -451,6 +516,9 @@ typedef enum {
 
 static __always_inline void ksu_common_newfstat_ret(unsigned long fd_long, void **statbuf_ptr, const int type)
 {
+    if (ksu_is_recovery_boot())
+        return;
+
     if (ksu_init_rc_hook_inactive())
         return;
 
@@ -527,8 +595,14 @@ void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_pt
 #ifdef CONFIG_KSU_SUSFS
 void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr)
 {
-    loff_t new_size = *kstat_size_ptr + ksu_rc_len;
-    struct file *file = fget(fd);
+    loff_t new_size;
+    struct file *file;
+
+    if (ksu_is_recovery_boot())
+        return;
+
+    new_size = *kstat_size_ptr + ksu_rc_len;
+    file = fget(fd);
 
     if (!file)
         return;
@@ -545,6 +619,12 @@ void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr)
 void ksu_handle_initrc(struct file *file)
 {
     if (!file) {
+        return;
+    }
+
+    if (ksu_is_recovery_boot()) {
+        stop_init_rc_hook();
+        ksu_stop_input_hook_runtime();
         return;
     }
 
@@ -628,6 +708,11 @@ int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *v
 #ifdef CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK
     return 0; // dummy manual hook
 #else
+    if (ksu_is_recovery_boot()) {
+        ksu_stop_input_hook_runtime();
+        return 0;
+    }
+
     if (ksu_input_hook_inactive())
         return 0;
 
@@ -761,6 +846,10 @@ void ksu_stop_ksud_execve_hook(void)
 bool ksu_is_safe_mode()
 {
     static bool safe_mode = false;
+
+    if (ksu_is_recovery_boot())
+        return false;
+
     if (safe_mode) {
         // don't need to check again, userspace may call multiple times
         return true;

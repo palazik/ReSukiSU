@@ -68,6 +68,16 @@ config KSU_MULTI_MANAGER_SUPPORT
 	help
 		Enable multi KernelSU manager support
 
+config KSU_DISABLE_IN_RECOVERY
+	bool "Disable KernelSU userspace hooks in recovery"
+	depends on KSU
+	default y
+	help
+	  Skip KernelSU init.rc injection, sucompat, and input safe-mode hooks
+	  when a recovery or TWRP ramdisk is detected. This keeps recovery-as-boot
+	  images from rebooting because recovery init/sepolicy is not an Android
+	  system boot environment.
+
 config KPM
     bool "Enable SukiSU KPM"
     depends on KSU && 64BIT

@@ -26,5 +26,6 @@ void ksu_handle_execveat_ksud(const char *filename, struct user_arg_ptr *argv, s
 void ksu_execve_hook_ksud(const struct pt_regs *regs);
 void ksu_stop_ksud_execve_hook(void);
 void ksu_stop_input_hook_runtime(void);
+bool ksu_is_recovery_boot(void);
 
 #endif
