@@ -82,7 +82,6 @@ bool ksu_is_recovery_boot(void)
         "androidboot.mode=recovery",
         "androidboot.bootmode=recovery",
         "bootmode=recovery",
-        "androidboot.force_normal_boot=0",
     };
     static const char * const recovery_ramdisk_paths[] = {
         "/init.recovery.qcom.rc",
