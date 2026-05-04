@@ -99,9 +99,18 @@ static int do_get_info(void __user *arg)
 static int do_report_event(void __user *arg)
 {
     struct ksu_report_event_cmd cmd;
+    static bool recovery_event_logged;
 
     if (copy_from_user(&cmd, arg, sizeof(cmd))) {
         return -EFAULT;
+    }
+
+    if (ksu_is_recovery_boot()) {
+        if (!recovery_event_logged) {
+            pr_info("report_event skipped in recovery/TWRP boot\n");
+            recovery_event_logged = true;
+        }
+        return 0;
     }
 
     switch (cmd.event) {

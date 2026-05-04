@@ -23,6 +23,7 @@
 #endif
 #include <linux/kprobes.h>
 #include <linux/printk.h>
+#include <linux/string.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/namei.h>
@@ -72,59 +73,139 @@ static const char KERNEL_SU_RC[] =
 static void stop_init_rc_hook(void);
 static void stop_execve_hook(void);
 
+#ifdef CONFIG_KSU_DISABLE_IN_RECOVERY
+static bool ksu_cmdline_has_any(const char * const tokens[], int count,
+				const char **matched)
+{
+	int i;
+
+	if (!saved_command_line)
+		return false;
+
+	for (i = 0; i < count; i++) {
+		if (strstr(saved_command_line, tokens[i])) {
+			if (matched)
+				*matched = tokens[i];
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool ksu_path_has_any(const char * const paths[], int count,
+			     const char **matched)
+{
+	int i;
+
+	for (i = 0; i < count; i++) {
+		struct path path;
+
+		if (!kern_path(paths[i], LOOKUP_FOLLOW, &path)) {
+			path_put(&path);
+			if (matched)
+				*matched = paths[i];
+			return true;
+		}
+	}
+
+	return false;
+}
+#endif
+
 bool ksu_is_recovery_boot(void)
 {
 #ifdef CONFIG_KSU_DISABLE_IN_RECOVERY
     static bool recovery_boot;
-    static bool recovery_checked;
+    static bool boot_mode_known;
     static bool recovery_logged;
+    static bool normal_logged;
+    static bool weak_recovery_logged;
+    const char *matched = NULL;
+    static const char * const normal_cmdline_tokens[] = {
+        "androidboot.force_normal_boot=1",
+        "androidboot.force_normal_boot=true",
+        "androidboot.mode=normal",
+        "androidboot.bootmode=normal",
+        "bootmode=normal",
+    };
     static const char * const recovery_cmdline_tokens[] = {
         "androidboot.mode=recovery",
         "androidboot.bootmode=recovery",
         "bootmode=recovery",
     };
+    static const char * const normal_system_paths[] = {
+        "/system/bin/init",
+        "/system/bin/app_process",
+        "/system/bin/app_process32",
+        "/system/bin/app_process64",
+        "/apex/com.android.runtime/bin/app_process32",
+        "/apex/com.android.runtime/bin/app_process64",
+    };
     static const char * const recovery_ramdisk_paths[] = {
         "/init.recovery.qcom.rc",
         "/init.recovery.usb.rc",
-        "/system/etc/recovery.fstab",
         "/etc/recovery.fstab",
+        "/etc/twrp.fstab",
         "/sbin/recovery",
+        "/sbin/twrp",
         "/twres",
     };
-    int i;
 
-    if (recovery_boot)
-        return true;
-    if (recovery_checked)
+    if (boot_mode_known)
+        return recovery_boot;
+
+    if (ksu_cmdline_has_any(normal_cmdline_tokens,
+                            ARRAY_SIZE(normal_cmdline_tokens), &matched)) {
+        boot_mode_known = true;
+        recovery_boot = false;
+        if (!normal_logged) {
+            pr_info("normal system boot detected by %s, keeping KernelSU userspace hooks enabled\n", matched);
+            normal_logged = true;
+        }
         return false;
-
-    if (saved_command_line) {
-        for (i = 0; i < ARRAY_SIZE(recovery_cmdline_tokens); i++) {
-            if (strstr(saved_command_line, recovery_cmdline_tokens[i])) {
-                recovery_boot = true;
-                break;
-            }
-        }
     }
 
-    if (!recovery_boot) {
-        for (i = 0; i < ARRAY_SIZE(recovery_ramdisk_paths); i++) {
-            struct path path;
-
-            if (!kern_path(recovery_ramdisk_paths[i], LOOKUP_FOLLOW, &path)) {
-                path_put(&path);
-                recovery_boot = true;
-                break;
-            }
-        }
+    if (ksu_path_has_any(recovery_ramdisk_paths,
+                         ARRAY_SIZE(recovery_ramdisk_paths), &matched)) {
+        recovery_boot = true;
+        goto out_known;
     }
 
+    if (ksu_path_has_any(normal_system_paths,
+                         ARRAY_SIZE(normal_system_paths), &matched)) {
+        boot_mode_known = true;
+        recovery_boot = false;
+        if (!normal_logged) {
+            pr_info("normal system boot detected by %s, keeping KernelSU userspace hooks enabled\n", matched);
+            normal_logged = true;
+        }
+        return false;
+    }
+
+    if (ksu_cmdline_has_any(recovery_cmdline_tokens,
+                            ARRAY_SIZE(recovery_cmdline_tokens), &matched)) {
+        /*
+         * Some recovery-as-boot vendor cmdlines can carry recovery-looking
+         * values during a normal Android boot. Do not disable system KSU until
+         * a recovery/TWRP ramdisk marker confirms the userspace environment.
+         */
+        if (!weak_recovery_logged) {
+            pr_info("recovery cmdline marker %s seen without TWRP ramdisk marker, keeping KernelSU userspace hooks enabled\n",
+                    matched);
+            weak_recovery_logged = true;
+        }
+        return false;
+    }
+
+    return false;
+
+out_known:
+    boot_mode_known = true;
     if (recovery_boot && !recovery_logged) {
-        pr_info("recovery boot detected, skipping KernelSU userspace hooks\n");
+        pr_info("recovery/TWRP boot detected by %s, skipping KernelSU userspace hooks\n", matched);
         recovery_logged = true;
     }
-
-    recovery_checked = true;
     return recovery_boot;
 #else
     return false;
