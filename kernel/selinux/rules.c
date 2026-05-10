@@ -298,10 +298,23 @@ out_free:
 
 #define KSU_SEPOLICY_MAX_BATCH_SIZE (8U * 1024U * 1024U)
 #define KSU_SEPOLICY_MAX_ARGS 5
+#define KSU_LEGACY_SEPOLICY_MAX_LEN 128
 
 struct sepol_data {
     u32 cmd;
     u32 subcmd;
+};
+
+struct sepol_legacy_data {
+    u32 cmd;
+    u32 subcmd;
+    const char __user *sepol1;
+    const char __user *sepol2;
+    const char __user *sepol3;
+    const char __user *sepol4;
+    const char __user *sepol5;
+    const char __user *sepol6;
+    const char __user *sepol7;
 };
 
 struct sepol_batch_cursor {
@@ -390,6 +403,37 @@ static int sepol_expected_argc(u32 cmd)
     default:
         return -EINVAL;
     }
+}
+
+static int sepol_write_legacy_string(u8 **cursor, const char __user *user_object)
+{
+    u32 len = 0;
+    long user_len;
+
+    if (!user_object) {
+        memcpy(*cursor, &len, sizeof(len));
+        *cursor += sizeof(len);
+        **cursor = '\0';
+        *cursor += 1;
+        return 0;
+    }
+
+    user_len = strnlen_user(user_object, KSU_LEGACY_SEPOLICY_MAX_LEN);
+    if (user_len <= 0 || user_len > KSU_LEGACY_SEPOLICY_MAX_LEN) {
+        return -EINVAL;
+    }
+
+    len = (u32)user_len - 1;
+    memcpy(*cursor, &len, sizeof(len));
+    *cursor += sizeof(len);
+
+    if (copy_from_user(*cursor, user_object, (size_t)user_len)) {
+        return -EFAULT;
+    }
+    (*cursor)[user_len - 1] = '\0';
+    *cursor += user_len;
+
+    return 0;
 }
 
 static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *header, const char **args)
@@ -561,29 +605,19 @@ static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *
     }
 }
 
-int handle_sepolicy(void __user *user_data, u64 data_len)
+static int handle_sepolicy_payload(const u8 *payload, u64 data_len)
 {
     struct policydb *db;
     struct sepol_batch_cursor cursor;
-    u8 *payload;
     int ret = 0;
     int success_cmd_count = 0;
     u32 cmd_index = 0;
 
-    if (!user_data || !data_len)
+    if (!payload || !data_len)
         return -EINVAL;
 
     if (data_len > KSU_SEPOLICY_MAX_BATCH_SIZE)
         return -E2BIG;
-
-    payload = vmalloc((size_t)data_len);
-    if (!payload)
-        return -ENOMEM;
-
-    if (copy_from_user(payload, user_data, (size_t)data_len)) {
-        ret = -EFAULT;
-        goto out_free;
-    }
 
     if (!getenforce()) {
         pr_info("SELinux permissive or disabled when handle policy!\n");
@@ -625,7 +659,7 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
     if (len < 0) {
         kfree(oldpolicydb);
         ret = len;
-        goto out_free;
+        goto out_unlock_legacy;
     }
 #endif
 
@@ -701,10 +735,10 @@ out_unlock:
 
     /* Free buffer */
     kfree(oldpolicydb);
+    ret = success_cmd_count;
 #endif
-out_free:
-    vfree(payload);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) && !defined(KSU_COMPAT_HAS_POLICY_MUTEX)
+out_unlock_legacy:
     ksu_unlock_sel_mutex_legacy();
 #endif
 
@@ -714,6 +748,84 @@ out_free:
 out_drop_new_policy:
     ksu_destroy_policydb(newpolicydb);
     kfree(oldpolicydb);
-    goto out_free;
+    goto out_unlock_legacy;
 #endif
+}
+
+int handle_sepolicy(void __user *user_data, u64 data_len)
+{
+    u8 *payload;
+    int ret;
+
+    if (!user_data || !data_len)
+        return -EINVAL;
+
+    if (data_len > KSU_SEPOLICY_MAX_BATCH_SIZE)
+        return -E2BIG;
+
+    payload = vmalloc((size_t)data_len);
+    if (!payload)
+        return -ENOMEM;
+
+    if (copy_from_user(payload, user_data, (size_t)data_len)) {
+        ret = -EFAULT;
+    } else {
+        ret = handle_sepolicy_payload(payload, data_len);
+    }
+
+    vfree(payload);
+    return ret;
+}
+
+int handle_legacy_sepolicy(void __user *user_data)
+{
+    struct sepol_legacy_data legacy;
+    struct sepol_data header;
+    const char __user *args[KSU_SEPOLICY_MAX_ARGS];
+    u8 *payload, *cursor;
+    size_t payload_cap;
+    u64 payload_len;
+    int expected_argc;
+    int ret;
+    int i;
+
+    if (!user_data)
+        return -EINVAL;
+
+    if (copy_from_user(&legacy, user_data, sizeof(legacy)))
+        return -EFAULT;
+
+    expected_argc = sepol_expected_argc(legacy.cmd);
+    if (expected_argc < 0 || expected_argc > KSU_SEPOLICY_MAX_ARGS)
+        return -EINVAL;
+
+    args[0] = legacy.sepol1;
+    args[1] = legacy.sepol2;
+    args[2] = legacy.sepol3;
+    args[3] = legacy.sepol4;
+    args[4] = legacy.sepol5;
+
+    payload_cap = sizeof(header) + expected_argc * (sizeof(u32) + KSU_LEGACY_SEPOLICY_MAX_LEN);
+    payload = vmalloc(payload_cap);
+    if (!payload)
+        return -ENOMEM;
+
+    header.cmd = legacy.cmd;
+    header.subcmd = legacy.subcmd;
+    cursor = payload;
+    memcpy(cursor, &header, sizeof(header));
+    cursor += sizeof(header);
+
+    for (i = 0; i < expected_argc; i++) {
+        ret = sepol_write_legacy_string(&cursor, args[i]);
+        if (ret < 0)
+            goto out_free;
+    }
+
+    payload_len = (u64)(cursor - payload);
+    ret = handle_sepolicy_payload(payload, payload_len);
+
+out_free:
+    vfree(payload);
+    return ret;
 }

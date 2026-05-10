@@ -46,6 +46,7 @@ static inline int __must_check ksu_kref_get_unless_zero(struct kref *kref)
 
 #define KSU_APP_PROFILE_PRESERVE_UID 9999 // NOBODY_UID
 #define KSU_DEFAULT_SELINUX_DOMAIN "u:r:" KERNEL_SU_DOMAIN ":s0"
+#define KSU_LEGACY_SU_SELINUX_DOMAIN "u:r:su:s0"
 
 static DEFINE_MUTEX(allowlist_mutex);
 
@@ -66,8 +67,8 @@ static void __init init_default_profiles()
     default_root_profile.namespaces = KSU_NS_INHERITED;
     strcpy(default_root_profile.selinux_domain, KSU_DEFAULT_SELINUX_DOMAIN);
 
-    // This means that we will umount modules by default!
-    default_non_root_profile.umount_modules = true;
+    // Keep module mounts visible by default for LSPosed/Xposed compatibility.
+    default_non_root_profile.umount_modules = false;
 }
 
 struct perm_data {
@@ -136,11 +137,8 @@ static bool profile_valid(struct app_profile *profile)
         return false;
     }
 
-    bool need_migrate_su_domain = false;
-
     if (unlikely(profile->version == 2)) {
         profile->version = KSU_APP_PROFILE_VER;
-        need_migrate_su_domain = true;
     }
 
     if (strnlen(profile->key, sizeof(profile->key)) >= sizeof(profile->key)) {
@@ -162,14 +160,14 @@ static bool profile_valid(struct app_profile *profile)
 
         char *domain = profile->rp_config.profile.selinux_domain;
         static const size_t domain_len = sizeof(profile->rp_config.profile.selinux_domain);
-        if (unlikely(need_migrate_su_domain)) {
-            if (strncmp(domain, "u:r:su:s0", domain_len) == 0) {
-                memset(domain, 0, domain_len);
-                // domain_len - 1 as implicit null termination
-                strncpy(domain, KSU_DEFAULT_SELINUX_DOMAIN, domain_len - 1);
-                pr_info("migrated profile domain: %s\n", profile->key);
-            }
+
+        if (strncmp(domain, KSU_LEGACY_SU_SELINUX_DOMAIN, domain_len) == 0) {
+            memset(domain, 0, domain_len);
+            // domain_len - 1 as implicit null termination
+            strncpy(domain, KSU_DEFAULT_SELINUX_DOMAIN, domain_len - 1);
+            pr_info("migrated profile domain: %s\n", profile->key);
         }
+
         size_t len = strnlen(domain, domain_len);
 
         if (len == 0 || len >= domain_len) {

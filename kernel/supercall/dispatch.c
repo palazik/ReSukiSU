@@ -163,6 +163,10 @@ static int do_set_sepolicy(void __user *arg)
         return -EFAULT;
     }
 
+    if (cmd.data_len == 0 && cmd.data) {
+        return handle_legacy_sepolicy((void __user *)cmd.data);
+    }
+
     return handle_sepolicy((void __user *)cmd.data, cmd.data_len);
 }
 

@@ -1,6 +1,7 @@
 #include "linux/cred.h"
 #include "linux/sched.h"
 #include "linux/security.h"
+#include "linux/string.h"
 #include "linux/version.h"
 #include "selinux_defs.h"
 #include "klog.h" // IWYU pragma: keep
@@ -23,6 +24,22 @@ static u32 cached_su_sid __read_mostly = 0;
 static u32 cached_zygote_sid __read_mostly = 0;
 static u32 cached_init_sid __read_mostly = 0;
 u32 ksu_file_sid __read_mostly = 0;
+
+static const char *normalize_selinux_domain(const char *domain)
+{
+    if (!domain)
+        return NULL;
+
+    /*
+     * SukiSU-Ultra v4.1.2 manager still uses the old KernelSU "su" domain in
+     * app profiles. This tree renamed the runtime domain to "ksu", so map the
+     * manager default before resolving the SID.
+     */
+    if (strcmp(domain, "u:r:su:s0") == 0)
+        return KERNEL_SU_CONTEXT;
+
+    return domain;
+}
 
 static int transive_to_domain(const char *domain, struct cred *cred, bool clear_exec_sid)
 {
@@ -56,6 +73,12 @@ static int transive_to_domain(const char *domain, struct cred *cred, bool clear_
 
 void setup_selinux(const char *domain, struct cred *cred)
 {
+    domain = normalize_selinux_domain(domain);
+    if (!domain) {
+        pr_err("selinux domain is NULL.\n");
+        return;
+    }
+
     if (transive_to_domain(domain, cred, false)) {
         pr_err("transive domain failed.\n");
         return;

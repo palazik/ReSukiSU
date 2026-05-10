@@ -36,6 +36,7 @@ bool is_init(const struct cred *cred);
 void apply_kernelsu_rules(void);
 
 int handle_sepolicy(void __user *user_data, u64 data_len);
+int handle_legacy_sepolicy(void __user *user_data);
 
 void setup_ksu_cred_selinux(void);
 

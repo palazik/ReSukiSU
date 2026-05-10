@@ -28,7 +28,7 @@
 #include "runtime/ksud_boot.h"
 #include "ksu.h"
 
-static bool ksu_kernel_umount_enabled = true;
+static bool ksu_kernel_umount_enabled = false;
 
 static int kernel_umount_feature_get(u64 *value)
 {
@@ -149,14 +149,13 @@ int ksu_handle_umount(uid_t old_uid, uid_t new_uid)
 
     // no need to check zygote here, because we already check it in the setuid call.
 
-    // in susfs's implementation, ksu_kernel_umount is ignored, so this keeps the same behavior.
     if (!ksu_kernel_umount_enabled) {
-        goto skip_umount_task;
+        return 0;
     }
 
     // if there isn't any module mounted, just ignore it!
     if (!ksu_module_mounted) {
-        goto skip_umount_task;
+        return 0;
     }
 
     // umount the target mnt
@@ -173,7 +172,6 @@ int ksu_handle_umount(uid_t old_uid, uid_t new_uid)
 
     revert_creds(saved);
 
-skip_umount_task:
     // do susfs setuid when susfs enabled
 #ifdef CONFIG_KSU_SUSFS
     schedule_work(&susfs_extra_works);
