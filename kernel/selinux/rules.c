@@ -14,9 +14,15 @@
 #include "ss/services.h"
 #include "linux/lsm_audit.h" // IWYU pragma: keep
 #include "xfrm.h"
+#include "infra/symbol_resolver.h"
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
 #define SELINUX_POLICY_INSTEAD_SELINUX_SS
+
+struct selinux_policy *backup_sepolicy;
+#else
+struct policydb *backup_policydb;
+struct sidtab *backup_sidtab;
 #endif
 
 #define ALL NULL
@@ -80,21 +86,9 @@ struct selinux_fs_info {
 };
 #endif
 
-// 4.14- it is static...
-// so we must make it unsafe
 #ifndef KSU_COMPAT_USE_SELINUX_STATE
-
-#ifdef KSU_COMPAT_HAS_EXPORTED_SEL_MUTEX
-extern struct mutex sel_mutex;
-#else
-DEFINE_MUTEX(ksu_sel_mutex);
-#endif
-
-// handle backport
-#ifdef KSU_COMPAT_HAS_EXPORTED_POLICY_RWLOCK
-extern rwlock_t policy_rwlock;
-#endif
-
+static struct mutex *ksu_sel_mutex_ptr = NULL;
+rwlock_t *ksu_policy_rwlock_ptr = NULL;
 #endif // #ifndef KSU_COMPAT_USE_SELINUX_STATE
 
 static inline void ksu_lock_sel_mutex_legacy(void)
@@ -103,13 +97,9 @@ static inline void ksu_lock_sel_mutex_legacy(void)
 #if defined(KSU_COMPAT_USE_SELINUX_STATE) && !defined(SELINUX_POLICY_INSTEAD_SELINUX_SS)
     struct selinux_fs_info *fsi = selinuxfs_mount->mnt_sb->s_fs_info;
     mutex_lock(&fsi->mutex);
-// 4.14- with manual export rwlock
-#elif defined(KSU_COMPAT_HAS_EXPORTED_SEL_MUTEX)
-    mutex_lock(&sel_mutex);
-// 4.14- mostly
+// 4.14-
 #else
-    mutex_lock(&ksu_sel_mutex);
-    preempt_disable();
+    mutex_lock(ksu_sel_mutex_ptr);
 #endif
 }
 
@@ -119,12 +109,9 @@ static inline void ksu_unlock_sel_mutex_legacy(void)
 #if defined(KSU_COMPAT_USE_SELINUX_STATE) && !defined(SELINUX_POLICY_INSTEAD_SELINUX_SS)
     struct selinux_fs_info *fsi = selinuxfs_mount->mnt_sb->s_fs_info;
     mutex_unlock(&fsi->mutex);
-// 4.14- with manual export rwlock
-#elif defined(KSU_COMPAT_HAS_EXPORTED_SEL_MUTEX)
-    mutex_unlock(&sel_mutex);
-// 4.14- mostly
+// 4.14-
 #else
-    mutex_unlock(&ksu_sel_mutex);
+    mutex_unlock(ksu_sel_mutex_ptr);
 #endif
 }
 
@@ -133,12 +120,9 @@ static inline void ksu_lock_sepolicy_legacy(void)
 // 4.14 - 5.10
 #if defined(KSU_COMPAT_USE_SELINUX_STATE) && !defined(SELINUX_POLICY_INSTEAD_SELINUX_SS)
     write_lock_irq(&selinux_state.ss->policy_rwlock);
-// 4.14- with manual export rwlock
-#elif defined(KSU_COMPAT_HAS_EXPORTED_POLICY_RWLOCK)
-    write_lock_irq(&policy_rwlock);
-// 4.14- mostly
+// 4.14-
 #else
-    // do nothing
+    write_lock_irq(ksu_policy_rwlock_ptr);
 #endif
 }
 
@@ -147,12 +131,9 @@ static inline void ksu_unlock_sepolicy_legacy(void)
 // 4.14 - 5.10
 #if defined(KSU_COMPAT_USE_SELINUX_STATE) && !defined(SELINUX_POLICY_INSTEAD_SELINUX_SS)
     write_unlock_irq(&selinux_state.ss->policy_rwlock);
-// 4.14- with manual export rwlock
-#elif defined(KSU_COMPAT_HAS_EXPORTED_POLICY_RWLOCK)
-    write_unlock_irq(&policy_rwlock);
-// 4.14- mostly
+// 4.14-
 #else
-    // do nothing
+    write_unlock_irq(ksu_policy_rwlock_ptr);
 #endif
 }
 
@@ -169,6 +150,29 @@ void apply_kernelsu_rules()
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_POLICY_MUTEX)
     struct selinux_policy *pol, *old_pol = selinux_state.policy;
     mutex_lock(&selinux_state.policy_mutex);
+    backup_sepolicy =
+        ksu_dup_sepolicy(rcu_dereference_protected(old_pol, lockdep_is_held(&selinux_state.policy_mutex)));
+    if (IS_ERR(backup_sepolicy)) {
+        pr_err("failed to create backup sepolicy: %ld\n", PTR_ERR(backup_sepolicy));
+        backup_sepolicy = NULL;
+    } else {
+        backup_sepolicy->sidtab = kzalloc(sizeof(*backup_sepolicy->sidtab), GFP_KERNEL);
+        if (!backup_sepolicy->sidtab) {
+            pr_err("failed to alloc backup sidtab\n");
+            ksu_destroy_sepolicy(backup_sepolicy);
+            backup_sepolicy = NULL;
+        } else {
+            int ret = policydb_load_isids(&backup_sepolicy->policydb, backup_sepolicy->sidtab);
+            if (ret) {
+                pr_err("failed to load isids for backup sepolicy: %d!\n", ret);
+                kfree(backup_sepolicy->sidtab);
+                ksu_destroy_sepolicy(backup_sepolicy);
+                backup_sepolicy = NULL;
+            } else {
+                pr_info("backup sepolicy success! latest_granting=%d\n", backup_sepolicy->latest_granting);
+            }
+        }
+    }
     pol = ksu_dup_sepolicy(rcu_dereference_protected(old_pol, lockdep_is_held(&selinux_state.policy_mutex)));
     if (IS_ERR(pol)) {
         pr_err("failed to dup selinux_policy: %ld\n", PTR_ERR(pol));
@@ -186,13 +190,44 @@ void apply_kernelsu_rules()
     newpolicydb = oldpolicydb + 1;
     db = newpolicydb;
 
+    backup_policydb = kzalloc(sizeof(*backup_policydb), GFP_KERNEL);
+
     ksu_lock_sel_mutex_legacy();
+
+    len = ksu_dup_policydb(policydb_ptr, backup_policydb);
+    pr_info("len of ksu_dup_policydb (backup_db) output: %d", len);
+    if (len < 0) {
+        pr_err("failed to dup policydb");
+        kfree(backup_policydb);
+        backup_policydb = NULL;
+        backup_sidtab = NULL;
+    } else {
+        backup_sidtab = kzalloc(sizeof(*backup_sidtab), GFP_KERNEL);
+        if (!backup_sidtab) {
+            pr_err("failed to alloc backup sidtab\n");
+            ksu_destroy_policydb(backup_policydb);
+            kfree(backup_policydb);
+            backup_policydb = NULL;
+            backup_sidtab = NULL;
+        } else {
+            int ret = policydb_load_isids(backup_policydb, backup_sidtab);
+            if (ret) {
+                pr_err("failed to load isids for backup sepolicy: %d!\n", ret);
+                kfree(backup_sidtab);
+                ksu_destroy_policydb(backup_policydb);
+                kfree(backup_policydb);
+                backup_policydb = NULL;
+                backup_sidtab = NULL;
+            } else {
+                pr_info("backup sepolicy success!\n");
+            }
+        }
+    }
 
     len = ksu_dup_policydb(policydb_ptr, db);
     pr_info("len of ksu_dup_policydb output: %d", len);
 
     if (len < 0) {
-        kfree(oldpolicydb);
         pr_err("failed to dup policydb\n");
         goto out_free;
     }
@@ -253,6 +288,13 @@ void apply_kernelsu_rules()
     ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "connectto");
     ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getopt");
     ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getattr");
+
+    // use memfd created by su domain
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "execute");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "getattr");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "map");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "read");
+    ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "memfd_file", "write");
 
     // bootctl
     ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "dir", "search");
@@ -720,6 +762,7 @@ out_drop_new_policy:
 out_unlock:
     mutex_unlock(&selinux_state.policy_mutex);
 #else
+    ret = success_cmd_count;
     /* Save the old policydb to free later. */
     memcpy(oldpolicydb, policydb_ptr, sizeof(*policydb_ptr));
 
@@ -751,6 +794,7 @@ out_drop_new_policy:
     goto out_unlock_legacy;
 #endif
 }
+
 
 int handle_sepolicy(void __user *user_data, u64 data_len)
 {
@@ -828,4 +872,22 @@ int handle_legacy_sepolicy(void __user *user_data)
 out_free:
     vfree(payload);
     return ret;
+
+void __init ksu_selinux_init()
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 17, 0) && !defined(KSU_COMPAT_USE_SELINUX_STATE)
+
+#ifdef CONFIG_KALLSYMS_ALL
+    ksu_sel_mutex_ptr = (struct mutex *)ksu_resolve_symbol_for_functable_hook("sel_mutex");
+    ksu_policy_rwlock_ptr = (rwlock_t *)ksu_resolve_symbol_for_functable_hook("policy_rwlock");
+#else
+    extern struct mutex sel_mutex;
+    extern rwlock_t policy_rwlock;
+
+    ksu_sel_mutex_ptr = &sel_mutex;
+    ksu_policy_rwlock_ptr = &policy_rwlock;
+#endif
+
+#endif
+
 }
